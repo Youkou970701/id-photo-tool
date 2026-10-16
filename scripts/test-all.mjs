@@ -10,6 +10,8 @@ const sharp = require('sharp');
 const { validateOptions, decodeImage, cropForFace, validateCrop, encodeWithinRange, processPhoto, saveExclusive,
   findHeadTop, renderPortrait, validateOutputHeadroom } = require('../src/photo');
 const vision = require('../src/vision');
+const { rollDegrees, needsRotation, yawRatio, warnsYaw, rotateDecodedImage } = require('../src/pose');
+const { cropInvalidRatios } = require('../src/validity');
 const { detectFaces, segmentPortrait } = require('../src/vision');
 const root = fileURLToPath(new URL('../', import.meta.url));
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), '报名照-tests-'));
@@ -80,6 +82,134 @@ try {
     image = await decodeImage(fixture); const faces=await detectFaces(image);
     assert.equal(faces.length,1,JSON.stringify(faces)); face=faces[0];
     assert.ok(face.x>100 && face.x<250); assert.ok(face.y<180);
+  });
+  await test('YuNet 返回五个原图坐标关键点及原图姿态', async () => {
+    assert.equal(face.landmarks.length,5);
+    for(const p of face.landmarks) {
+      assert.equal(p.length,2);assert.ok(p.every(Number.isFinite));
+      assert.ok(p[0]>=0 && p[0]<image.width && p[1]>=0 && p[1]<image.height);
+    }
+    assert.ok(face.landmarks[0][0]<face.landmarks[1][0]);
+    assert.ok(Math.abs(rollDegrees(face))<1);
+    assert.ok(Math.abs(yawRatio(face))<0.12);
+  });
+  for(const angle of [10,-10]) await test(`旋转方向回归 ${angle}°：端到端扶正，输出 JPEG 眼线小于 1°`, async () => {
+    const file=path.join(tmp,`歪头${angle}.png`);
+    await sharp(fixture).rotate(angle,{background:'#00000000'}).png().toFile(file);
+    const result=await checkedOutput(file,{...opts,width:256,height:320,maxKB:200});
+    assert.equal(result.rotated,true);
+    assert.ok(Math.sign(result.roll)===Math.sign(angle));
+    assert.ok(Math.abs(result.roll)>1 && Math.abs(result.roll)<=15);
+    assert.match(result.note,/已自动扶正约 .*°，肩部可能略倾斜/);
+    const outputFaces=await detectFaces(await decodeImage(result.output));
+    assert.equal(outputFaces.length,1);
+    assert.ok(Math.abs(rollDegrees(outputFaces[0]))<1,`输出 roll=${rollDegrees(outputFaces[0])}`);
+  });
+  await test('旋转 +20° 超限拒绝，提示包含角度且不生成文件', async () => {
+    const file=path.join(tmp,'过度歪头.png');
+    await sharp(fixture).rotate(20,{background:'#00000000'}).png().toFile(file);
+    await checkedFailure(file,/^头部倾斜约 \d+(?:\.\d+)?°，请摆正头部重拍$/);
+  });
+  await test('roll 正负对称：恰好 1° 不旋转、15° 可扶正、15.01° 拒绝', async () => {
+    assert.equal(needsRotation(0),false);
+    for(const sign of [1,-1]) {
+      assert.equal(needsRotation(sign),false);
+      assert.equal(needsRotation(sign*1.01),true);
+      assert.equal(needsRotation(sign*15),true);
+      assert.throws(()=>needsRotation(sign*15.01),/头部倾斜约 .*°/);
+    }
+    assert.throws(()=>needsRotation(NaN),/无法判断头部倾斜/);
+  });
+  await test('roll 按 atan2 保留方向，大倾角和退化关键点明确拒绝', async () => {
+    for(const degrees of [10,-10,90,-90,180]) {
+      const radians=degrees*Math.PI/180;
+      const f={landmarks:[[0,0],[100*Math.cos(radians),100*Math.sin(radians)],[30,50],[10,70],[80,70]]};
+      assert.ok(Math.abs(rollDegrees(f)-degrees)<1e-10);
+      if(Math.abs(degrees)>15)assert.throws(()=>needsRotation(rollDegrees(f)),/头部倾斜约 .*°/);
+    }
+    assert.throws(()=>rollDegrees({landmarks:[[0,0],[0,0],[0,1],[0,2],[1,2]]}),/无法可靠定位双眼/);
+    assert.throws(()=>rollDegrees({}),/无法可靠定位面部关键点/);
+  });
+  await test('旋转 12° 后紧裁透明角，按有效像素拒绝而非扩大画布放行', async () => {
+    const rotated=await rotateDecodedImage(image,12);
+    assert.equal(rotated.validity.length,rotated.width*rotated.height);
+    assert.equal(rotated.validity[0],0);
+    assert.equal(rotated.data[3],0,'旋转新增画布必须透明');
+    const crop={left:0,top:0,width:100,height:100};
+    assert.doesNotThrow(()=>validateCrop({width:rotated.width,height:rotated.height},crop,100));
+    assert.ok(cropInvalidRatios(rotated,crop).top>0.12);
+    assert.throws(()=>validateCrop(rotated,crop,100),/照片头顶不完整/);
+    assert.doesNotThrow(()=>validateCrop(rotated,{left:150,top:130,width:250,height:300},220));
+  });
+  await test('未旋转的有效像素统计与旧连续越界公式完全一致', async () => {
+    const im={width:200,height:200,validity:Buffer.alloc(200*200,255)};
+    for(const crop of [
+      {left:-15,top:-12,width:100,height:100},
+      {left:115,top:105,width:100,height:100},
+      {left:-15.01,top:-12.01,width:100,height:100},
+      {left:3.25,top:0.5,width:170.25,height:120.75},
+    ]) {
+      const expected={top:Math.max(0,-crop.top)/crop.height,
+        bottom:Math.max(0,crop.top+crop.height-im.height)/crop.height,
+        left:Math.max(0,-crop.left)/crop.width,
+        right:Math.max(0,crop.left+crop.width-im.width)/crop.width};
+      assert.deepEqual(cropInvalidRatios(im,crop),expected);
+      assert.deepEqual(cropInvalidRatios({...im,validity:undefined},crop),expected);
+    }
+  });
+  await test('yaw 正负对称：12% 提醒、11% 不提醒、25% 拒绝、24% 提醒', async () => {
+    for(const sign of [1,-1])for(const [ratio,expected]of[[0.11,false],[0.12,true],[0.24,true]]) {
+      const f={landmarks:[[0,0],[100,0],[50+sign*ratio*100,30],[30,60],[70,60]]};
+      assert.ok(Math.abs(yawRatio(f)-sign*ratio)<1e-12);
+      assert.equal(warnsYaw(sign*ratio),expected);
+    }
+    for(const sign of [1,-1])assert.throws(()=>warnsYaw(sign*0.25),/^Error: 脸部没有正对镜头，请正脸重拍$/);
+  });
+  await test('astronaut 原图不旋转、不提醒侧脸，返回 roll/rotated/yaw', async () => {
+    const file=path.join(tmp,'原图姿态.png');await fs.copyFile(fixture,file);
+    const r=await checkedOutput(file);
+    assert.equal(r.rotated,false);assert.ok(Math.abs(r.roll)<=1);assert.ok(Math.abs(r.yaw)<0.12);
+    assert.doesNotMatch(r.note,/已自动扶正|脸部略偏向/);
+  });
+  await test('扶正后必须重检且仍为一人、眼线不超过 1°，否则不保存', async () => {
+    const file=path.join(tmp,'复检失败.png');await fs.copyFile(fixture,file);
+    const tilted={...face,landmarks:face.landmarks.map(p=>[...p])};
+    tilted.landmarks[1][1]=tilted.landmarks[0][1]+Math.tan(10*Math.PI/180)*(tilted.landmarks[1][0]-tilted.landmarks[0][0]);
+    for(const after of [[],[face,face],[tilted]]) {
+      let calls=0;const stub=mock.method(vision,'detectFaces',async()=>++calls===1?[tilted]:after);
+      try { await checkedFailure(file,/扶正后/);assert.equal(calls,2); }
+      finally { stub.mock.restore(); }
+    }
+  });
+  await test('侧脸偏移只按扶正后关键点判断，不使用旋转前鼻尖偏移', async () => {
+    const file=path.join(tmp,'扶正后侧脸.png');
+    await sharp(fixture).rotate(10,{background:'#00000000'}).png().toFile(file);
+    const realDetect=vision.detectFaces;let calls=0;
+    const stub=mock.method(vision,'detectFaces',async im=>{
+      const fs=await realDetect(im);
+      if(++calls===1) {
+        const f=fs[0], [a,b]=f.landmarks;
+        f.landmarks[2][0]=(a[0]+b[0])/2+0.3*Math.hypot(b[0]-a[0],b[1]-a[1]);
+      }
+      return fs;
+    });
+    try {
+      const r=await checkedOutput(file,{...opts,width:256,height:320,maxKB:200});
+      assert.equal(calls,2);assert.equal(r.rotated,true);assert.ok(Math.abs(r.yaw)<0.12);
+      assert.doesNotMatch(r.note,/脸部略偏向/);
+    } finally { stub.mock.restore(); }
+  });
+  await test('侧脸提醒与拒绝贯通保存路径，超限不留文件', async () => {
+    const file=path.join(tmp,'侧脸策略.png');await fs.copyFile(fixture,file);
+    for(const ratio of [0.2,0.3]) {
+      const f={...face,landmarks:face.landmarks.map(p=>[...p])},[a,b]=f.landmarks;
+      f.landmarks[2][0]=(a[0]+b[0])/2+ratio*Math.hypot(b[0]-a[0],b[1]-a[1]);
+      const stub=mock.method(vision,'detectFaces',async()=>[f]);
+      try {
+        if(ratio===0.2){const r=await checkedOutput(file);assert.match(r.note,/脸部略偏向一侧，请确认是否符合正面要求/);}
+        else await checkedFailure(file,/^脸部没有正对镜头，请正脸重拍$/);
+      } finally { stub.mock.restore(); }
+    }
   });
   await test('头顶留白、脸部水平居中的裁剪几何', async () => {
     const headTop=findHeadTop(await segmentPortrait(image),image.width,image.height,face);
@@ -204,7 +334,8 @@ try {
   await test('截断额头的 alpha 延后 1～2px 仍拒绝，不被软边缘绕过', async () => {
     const file=path.join(tmp,'合成截断额头.png');
     await sharp({create:{width:400,height:600,channels:4,background:'#ddd'}}).png().toFile(file);
-    const faceStub=mock.method(vision,'detectFaces',async()=>[{x:150,y:10,width:100,height:100}]);
+    const faceStub=mock.method(vision,'detectFaces',async()=>[{x:150,y:10,width:100,height:100,
+      landmarks:[[175,40],[225,40],[200,65],[180,85],[220,85]]}]);
     try {
       for(const firstRow of [0,1,2]) {
         const alpha=Buffer.alloc(400*600);
