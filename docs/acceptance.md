@@ -9,6 +9,6 @@
 
 测试图片为 NASA 公有领域人像；这组测试只能证明这些夹具和代码边界，不代表复杂发丝、侧脸和所有报名系统都能通过。自动裁剪依据人脸框估算头顶，最终照片仍需用户查看。
 
-模型商用许可依据官方声明；MODNet 权重从已固定提交的社区导出镜像下载，不能声称已与官方 Drive 文件逐字节核对，详见 `vendor/models/manifest.json`。
+模型商用许可依据官方声明；MODNet 权重入库时从已固定提交的社区镜像下载。**已核对一致（2026-10-16）**：用户从官方 Drive 下载权重，Claude 确认与仓库文件 SHA-256、大小及逐字节比较均一致，详见 [核验记录](model-verification.md) 和 `vendor/models/manifest.json`。
 
 GitHub 的 Test 工作流在 main 推送后检查 macOS arm64 与 Windows x64，并在两平台执行安装包内真实推理。Release 工作流只在版本 tag 上发布；此次未创建或推送任何 tag。

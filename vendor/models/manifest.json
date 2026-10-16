@@ -15,7 +15,7 @@
       "downloadAccept": "application/vnd.github.raw+json",
       "mirrorCommit": "8c6f9df04c2dcc2cef63aeb8f84ccd1764685d51",
       "mirrorSource": "https://github.com/HarxSan/Modnet/blob/8c6f9df04c2dcc2cef63aeb8f84ccd1764685d51/modnet.onnx",
-      "provenance": "Official download was unreachable during vendoring. Bytes fetched from a pinned community mirror, whose README states it exports the official checkpoint with the upstream exporter. No byte-for-byte comparison to the Google Drive file was possible.",
+      "provenance": "Bytes were initially fetched from a pinned community mirror because the official download was unreachable during vendoring. 已核对一致（2026-10-16）：用户从官方 ONNX 文档链接的 Google Drive 下载权重，Claude 确认其与仓库文件 SHA-256、大小及逐字节比较均一致。See docs/model-verification.md.",
       "input": {"name": "input", "type": "float32", "shape": ["batch_size", 3, "height", "width"], "layout": "NCHW", "channels": "RGB", "normalization": "(value - 127.5) / 127.5", "spatialConstraint": "multiples of 32"},
       "output": {"name": "output", "shape": ["batch_size", 1, "height", "width"], "meaning": "foreground alpha matte"}
     },

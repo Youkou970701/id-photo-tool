@@ -2,7 +2,7 @@
 
 两个 ONNX 文件实际随应用打包；运行期间不下载模型、不联网推理。`node scripts/verify-models.mjs` 检查大小及 SHA-256，`manifest.json` 记录固定版本来源。
 
-- **MODNet 人像抠图**：上游 [ZHKKKe/MODNet](https://github.com/ZHKKKe/MODNet/tree/28165a451e4610c9d77cfdf925a94610bb2810fb)。上游 README 的 License 段明确将代码、模型和演示纳入 **Apache-2.0**，允许商业使用，许可原文随包保留。官方 ONNX 文档链接至 Google Drive。本次该下载地址无法连接，故使用固定提交的 [HarxSan/Modnet 社区镜像](https://github.com/HarxSan/Modnet/tree/8c6f9df04c2dcc2cef63aeb8f84ccd1764685d51)，镜像说明其使用官方权重及导出脚本；不能声称已与 Google Drive 文件逐字节对照。镜像 README 中“官方不发布预导出 ONNX”的表述与官方 ONNX 文档不一致，保留该文件仅作镜像来源记录，以官方文档为准。
+- **MODNet 人像抠图**：上游 [ZHKKKe/MODNet](https://github.com/ZHKKKe/MODNet/tree/28165a451e4610c9d77cfdf925a94610bb2810fb)。上游 README 的 License 段明确将代码、模型和演示纳入 **Apache-2.0**，允许商业使用，许可原文随包保留。官方 ONNX 文档链接至 Google Drive。入库时该下载地址无法连接，故使用固定提交的 [HarxSan/Modnet 社区镜像](https://github.com/HarxSan/Modnet/tree/8c6f9df04c2dcc2cef63aeb8f84ccd1764685d51)，镜像说明其使用官方权重及导出脚本。**已核对一致（2026-10-16）**：用户从官方 Drive 下载权重，Claude 确认与仓库文件 SHA-256、大小及逐字节比较均一致，见[核验记录](../../docs/model-verification.md)。镜像 README 中“官方不发布预导出 ONNX”的表述与官方 ONNX 文档不一致，保留该文件仅作镜像来源记录，以官方文档为准。
 - **YuNet 人脸检测**：来自 [OpenCV Zoo 固定提交](https://github.com/opencv/opencv_zoo/tree/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet)，文件 `face_detection_yunet_2023mar.onnx` 在本项目命名为 `yunet.onnx`。模型目录 **MIT** 许可，允许商业使用，原版权及许可文本随包保留。
 
 ## 输入与输出
