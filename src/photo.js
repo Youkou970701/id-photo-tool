@@ -2,7 +2,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const sharp = require('sharp');
-const { detectFaces, segmentPortrait } = require('./vision');
+const vision = require('./vision');
 const KB = 1024;
 const MAX_PIXELS = 100_000_000;
 const MAX_TOP_OVERFLOW_RATIO = 0.12;
@@ -10,6 +10,13 @@ const MAX_BOTTOM_OVERFLOW_RATIO = 0.05;
 const MAX_SIDE_OVERFLOW_RATIO = 0.15;
 const MAX_UPSCALE_FACTOR = 1.5;
 const WARN_UPSCALE_FACTOR = 1.2;
+const MIN_HEADROOM_RATIO = 0.08;
+const MAX_HEADROOM_RATIO = 0.14;
+const TARGET_HEADROOM_RATIO = (MIN_HEADROOM_RATIO + MAX_HEADROOM_RATIO) / 2;
+const MIN_OUTPUT_HEADROOM_RATIO = 0.05;
+const FOREGROUND_ALPHA_THRESHOLD = 128;
+const HEAD_SEARCH_HALF_FACE_WIDTH = 0.6;
+const HEAD_EDGE_TOLERANCE_FACE_HEIGHT_RATIO = 0.02;
 const DECODE_ERROR = '无法读取图片，文件可能损坏或格式不受支持';
 const WRITE_PERMISSION_ERROR = '无法写入原图所在文件夹，请把照片复制到桌面等可写位置再试';
 
@@ -51,12 +58,26 @@ async function decodeImage(input) {
   } catch { throw new Error(DECODE_ERROR); }
 }
 
-function cropForFace(face, width, height) {
-  // YuNet 检出框包含五官而非头发；向上扩 35% 作为头顶，再留 9% 画幅空白。
-  const cropHeight = face.height / 0.46;
+function findHeadTop(alpha, width, height, face) {
+  if (alpha.length !== width * height) throw new Error('人像蒙版尺寸无效');
+  const center = face ? face.x + face.width / 2 : width / 2;
+  const halfWidth = face ? HEAD_SEARCH_HALF_FACE_WIDTH * face.width : width / 2;
+  const left = Math.max(0, Math.floor(center - halfWidth));
+  const right = Math.min(width, Math.ceil(center + halfWidth));
+  for (let y = 0; y < height; y++) for (let x = left; x < right; x++) {
+    if (alpha[y * width + x] > FOREGROUND_ALPHA_THRESHOLD) return y;
+  }
+  throw new Error('未找到清晰的人像前景，请更换照片');
+}
+
+function cropForFace(face, width, height, headTop) {
+  if (!Number.isFinite(headTop) || headTop < 0) throw new Error('缺少人像蒙版头顶位置');
+  // 人脸占比保持原基准；帽子/高发型较高时扩大画幅，给下巴及肩部留空间。
+  const cropHeight = Math.max(face.height / 0.46,
+    (face.y + face.height * 1.25 - headTop) / (1 - TARGET_HEADROOM_RATIO));
   const cropWidth = cropHeight * width / height;
   return { left: face.x + face.width / 2 - cropWidth / 2,
-    top: face.y - face.height * 0.35 - cropHeight * 0.09, width: cropWidth, height: cropHeight };
+    top: headTop - cropHeight * TARGET_HEADROOM_RATIO, width: cropWidth, height: cropHeight };
 }
 
 function validateCrop(image, crop, targetHeight) {
@@ -75,12 +96,23 @@ function validateCrop(image, crop, targetHeight) {
 
 async function renderPortrait(image, face, options) {
   const { width, height, background } = options;
-  const crop = cropForFace(face, width, height);
-  validateCrop(image, crop, height);
-  // 在有界工作分辨率抠图后取景，保留透明 PNG 自带的 alpha。
-  const mask = await segmentPortrait(image);
+  // 先分割，再取景；透明 PNG 原 alpha 同时参与定位及终检。
+  const mask = await vision.segmentPortrait(image);
+  if (mask.length !== image.width * image.height) throw new Error('人像蒙版尺寸无效');
   const rgba = Buffer.from(image.data);
   for (let i = 0; i < image.width * image.height; i++) rgba[i * 4 + 3] = Math.round(rgba[i * 4 + 3] * mask[i] / 255);
+  const alpha = await sharp(rgba, { raw: { width: image.width, height: image.height, channels: 4 } })
+    .extractChannel('alpha').greyscale().raw().toBuffer();
+  const headTop = findHeadTop(alpha, image.width, image.height, face);
+  // 蒙版贴原图上沿时，无法凭 alpha 还原被切掉的部分。
+  // 保留首轮的人脸框完整性判据，仅用于拒绝截断额头，不再用它摆放头顶。
+  const baselineHeight = face.height / 0.46;
+  const missingTopRatio = (face.height * 0.35 + baselineHeight * 0.09 - face.y) / baselineHeight;
+  const edgeTolerance = Math.ceil(face.height * HEAD_EDGE_TOLERANCE_FACE_HEIGHT_RATIO);
+  if (headTop <= edgeTolerance && missingTopRatio > MAX_TOP_OVERFLOW_RATIO)
+    throw new Error('照片头顶不完整，请使用头顶上方有留白的照片');
+  const crop = cropForFace(face, width, height, headTop);
+  const upscale = validateCrop(image, crop, height);
   const left = Math.max(0, Math.floor(crop.left)), top = Math.max(0, Math.floor(crop.top));
   const right = Math.min(image.width, Math.ceil(crop.left + crop.width));
   const bottom = Math.min(image.height, Math.ceil(crop.top + crop.height));
@@ -93,8 +125,23 @@ async function renderPortrait(image, face, options) {
   const cut = await sharp(rgba, { raw: { width: image.width, height: image.height, channels: 4 } })
     .extract({ left, top, width: right - left, height: bottom - top })
     .resize(destWidth, destHeight).png().toBuffer();
-  return sharp({ create: { width, height, channels: 3, background } })
-    .composite([{ input: cut, left: destLeft, top: destTop }]).removeAlpha().png().toBuffer();
+  const layer = await sharp({ create: { width, height, channels: 4, background: '#00000000' } })
+    .composite([{ input: cut, left: destLeft, top: destTop }]).png().toBuffer();
+  const outputAlpha = await sharp(layer).extractChannel('alpha').greyscale().raw().toBuffer();
+  const pixels = await sharp(layer).flatten({ background }).removeAlpha().png().toBuffer();
+  return { pixels, alpha: outputAlpha, upscale, crop, face: {
+    x: (face.x - crop.left) * scale, width: face.width * scale,
+  } };
+}
+
+function validateOutputHeadroom(rendered, width, height) {
+  // 看输出图的真实前景 alpha，不从白底/蓝底 JPEG 颜色反推人物。
+  if (findHeadTop(rendered.alpha, width, height) / height < MIN_OUTPUT_HEADROOM_RATIO)
+    throw new Error('头顶离照片上沿太近');
+  const headroom = findHeadTop(rendered.alpha, width, height, rendered.face) / height;
+  if (headroom < MIN_HEADROOM_RATIO || headroom > MAX_HEADROOM_RATIO)
+    throw new Error('头顶留白不符合 8%～14% 要求，请更换照片');
+  return headroom;
 }
 
 async function encodeWithinRange(pixels, options) {
@@ -157,12 +204,13 @@ async function processPhoto(input, options, onProgress = () => {}) {
     onProgress('读取照片…');
     const image = await decodeImage(input);
     onProgress('本地识别人脸…');
-    const faces = await detectFaces(image);
+    const faces = await vision.detectFaces(image);
     if (!faces.length) throw new Error('未检测到人脸，请使用清晰、正面、光线充足的单人人像');
     if (faces.length !== 1) throw new Error(`检测到 ${faces.length} 张人脸，请使用只有一人的照片`);
-    const upscale = validateCrop(image, cropForFace(faces[0], o.width, o.height), o.height);
     onProgress('本地抠图、裁剪和换底色…');
-    const pixels = await renderPortrait(image, faces[0], o);
+    const rendered = await renderPortrait(image, faces[0], o);
+    const headroom = validateOutputHeadroom(rendered, o.width, o.height);
+    const { pixels, upscale } = rendered;
     onProgress('匹配文件大小区间…');
     const { data, quality, scale } = await encodeWithinRange(pixels, options);
     const meta = await sharp(data).metadata();
@@ -170,10 +218,11 @@ async function processPhoto(input, options, onProgress = () => {}) {
       throw new Error('最终校验失败，未输出文件');
     const output = await saveExclusive(input, data);
     return { ok: true, output, bytes: data.length, width: meta.width, height: meta.height,
-      quality, scale, preview: 'data:image/jpeg;base64,' + data.toString('base64'),
+      quality, scale, headroom, preview: 'data:image/jpeg;base64,' + data.toString('base64'),
       note: [
         upscale >= WARN_UPSCALE_FACTOR ? `原图偏小，已放大 ${upscale.toFixed(2)} 倍，请放大检查清晰度。` : '',
         scale < 1 ? '已降低细节分辨率以满足大小，请放大检查清晰度。报名是否通过仍以官方审核为准。' : '请检查发丝边缘、头顶留白与清晰度，报名是否通过以官方审核为准。',
+        '请确认未戴帽子、未戴深色眼镜。',
       ].filter(Boolean).join('') };
   } catch (e) { return { ok: false, note: e.message }; }
 }
@@ -185,5 +234,7 @@ async function previewPhoto(input) {
   return 'data:image/png;base64,' + data.toString('base64');
 }
 module.exports = { KB, MAX_TOP_OVERFLOW_RATIO, MAX_BOTTOM_OVERFLOW_RATIO, MAX_SIDE_OVERFLOW_RATIO,
-  MAX_UPSCALE_FACTOR, WARN_UPSCALE_FACTOR, validateOptions, decodeImage, cropForFace, validateCrop,
+  MAX_UPSCALE_FACTOR, WARN_UPSCALE_FACTOR, MIN_HEADROOM_RATIO, MAX_HEADROOM_RATIO,
+  TARGET_HEADROOM_RATIO, MIN_OUTPUT_HEADROOM_RATIO, FOREGROUND_ALPHA_THRESHOLD,
+  findHeadTop, validateOutputHeadroom, validateOptions, decodeImage, cropForFace, validateCrop,
   renderPortrait, encodeWithinRange, saveExclusive, processPhoto, previewPhoto };

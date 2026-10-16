@@ -7,7 +7,9 @@ import { createRequire } from 'node:module';
 import { mock } from 'node:test';
 const require = createRequire(import.meta.url);
 const sharp = require('sharp');
-const { validateOptions, decodeImage, cropForFace, validateCrop, encodeWithinRange, processPhoto, saveExclusive } = require('../src/photo');
+const { validateOptions, decodeImage, cropForFace, validateCrop, encodeWithinRange, processPhoto, saveExclusive,
+  findHeadTop, renderPortrait, validateOutputHeadroom } = require('../src/photo');
+const vision = require('../src/vision');
 const { detectFaces, segmentPortrait } = require('../src/vision');
 const root = fileURLToPath(new URL('../', import.meta.url));
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), '报名照-tests-'));
@@ -26,6 +28,8 @@ async function checkedOutput(file, options = opts) {
   assert.ok(buffer.length >= Math.ceil(options.minKB * 1024)); assert.ok(buffer.length <= Math.floor(options.maxKB * 1024));
   assert.deepEqual(await fs.readFile(file), before, '原图不得改动');
   assert.equal(path.dirname(r.output), path.dirname(file));
+  assert.ok(r.headroom>=0.08 && r.headroom<=0.14,`头顶留白 ${r.headroom}`);
+  assert.match(r.note,/请确认未戴帽子、未戴深色眼镜/);
   return r;
 }
 async function checkedFailure(file, message, options = opts) {
@@ -78,9 +82,10 @@ try {
     assert.ok(face.x>100 && face.x<250); assert.ok(face.y<180);
   });
   await test('头顶留白、脸部水平居中的裁剪几何', async () => {
-    const crop=cropForFace(face,opts.width,opts.height);
+    const headTop=findHeadTop(await segmentPortrait(image),image.width,image.height,face);
+    const crop=cropForFace(face,opts.width,opts.height,headTop);
     assert.ok(Math.abs((face.x+face.width/2-crop.left)/crop.width-0.5)<1e-8);
-    assert.ok((face.y-face.height*.35-crop.top)/crop.height>=.089);
+    assert.ok(Math.abs((headTop-crop.top)/crop.height-0.11)<1e-8);
     assert.ok(Math.abs(crop.width/crop.height-opts.width/opts.height)<1e-8);
   });
   await test('正常人像完整头顶仍然通过，且无放大提醒', async () => {
@@ -90,7 +95,9 @@ try {
   await test('脸部特写少量上溢仍然通过（不得误拒绝）', async () => {
     const file=path.join(tmp,'脸部特写.png');
     await sharp(fixture).extract({left:135,top:27,width:180,height:260}).png().toFile(file);
-    const im=await decodeImage(file), faces=await detectFaces(im), crop=cropForFace(faces[0],opts.width,opts.height);
+    const im=await decodeImage(file), faces=await detectFaces(im);
+    const headTop=findHeadTop(await segmentPortrait(im),im.width,im.height,faces[0]);
+    const crop=cropForFace(faces[0],opts.width,opts.height,headTop);
     const overflow=-crop.top/crop.height;
     assert.ok(overflow>0.09 && overflow<0.12,`特写上溢比例 ${overflow}`);
     await checkedOutput(file);
@@ -145,6 +152,79 @@ try {
     const mask=await segmentPortrait(image); assert.equal(mask.length,image.width*image.height);
     const mean=(x,y,size)=>{let total=0;for(let j=y;j<y+size;j++)for(let i=x;i<x+size;i++)total+=mask[j*image.width+i];return total/(size*size);};
     assert.ok(mean(0,0,30)<100,'左上角应为背景'); assert.ok(mean(210,90,30)>170,'面部应为前景');
+  });
+  await test('alpha 头顶搜索限定脸中心列带，128 不算前景', async () => {
+    const alpha=Buffer.alloc(100*100), f={x:40,width:20};
+    alpha[0]=255; // 带外高光不能改变头顶。
+    alpha[2*100+50]=128;alpha[9*100+38]=129;
+    assert.equal(findHeadTop(alpha,100,100,f),9);
+    assert.equal(findHeadTop(alpha,100,100),0);
+    assert.throws(()=>findHeadTop(Buffer.alloc(100*100),100,100,f),/未找到清晰的人像前景/);
+  });
+  await test('公有领域人像合成 0.6 脸高帽子，真实 MODNet 输出留白 8%～14%', async () => {
+    const hatHeight=Math.round(face.height*0.6), file=path.join(tmp,'合成高帽.png');
+    const extended=await sharp(fixture).extend({top:80,bottom:0,left:0,right:0,background:'#dddddd'}).png().toBuffer();
+    const hat=Buffer.from(`<svg width="512" height="592"><rect x="174" y="${110-hatHeight}" width="105" height="${hatHeight}" rx="10" fill="#292120"/><rect x="161" y="103" width="133" height="14" rx="4" fill="#292120"/></svg>`);
+    await sharp(extended).composite([{input:hat,left:0,top:0}]).png().toFile(file);
+    const im=await decodeImage(file), f=(await detectFaces(im))[0];
+    const headTop=findHeadTop(await segmentPortrait(im),im.width,im.height,f);
+    assert.ok(headTop < f.y-f.height*0.35-20,'确实复现五官框漏掉高帽的问题');
+    const rendered=await renderPortrait(im,f,opts);
+    const actual=findHeadTop(rendered.alpha,opts.width,opts.height)/opts.height;
+    assert.ok(actual>=0.08 && actual<=0.14,`完整输出前景留白 ${actual}`);
+    await checkedOutput(file);
+  });
+  await test('公有领域头发向上拉伸，295×413 白/蓝底均保留真实头顶', async () => {
+    const file=path.join(tmp,'合成长发顶.png');
+    const extended=await sharp(fixture).extend({top:80,bottom:0,left:0,right:0,background:'#dddddd'}).png().toBuffer();
+    const hair=await sharp(fixture).extract({left:180,top:15,width:90,height:55}).resize(90,125).png().toBuffer();
+    await sharp(extended).composite([{input:hair,left:180,top:25}]).png().toFile(file);
+    for(const background of ['#ffffff','#438edb']) {
+      const r=await checkedOutput(file,{...opts,width:295,height:413,minKB:10,maxKB:200,background});
+      const {data,info}=await sharp(r.output).raw().toBuffer({resolveWithObject:true});
+      // 独立检查实际 JPEG 的中央发顶，避免只信 processPhoto 返回的比例。
+      const bg=[1,3,5].map(i=>parseInt(background.slice(i,i+2),16));let top=-1;
+      for(let y=0;y<info.height && top<0;y++)for(let x=135;x<=160;x++) {
+        const offset=(y*info.width+x)*info.channels;
+        if(bg.some((v,c)=>Math.abs(data[offset+c]-v)>80)){top=y;break;}
+      }
+      assert.ok(top/info.height>=0.08 && top/info.height<=0.14,`JPEG 头顶留白 ${top/info.height}`);
+    }
+  });
+  await test('输出终检拒绝带外贴顶前景，不生成文件', async () => {
+    const file=path.join(tmp,'终检贴顶.png');await fs.copyFile(fixture,file);
+    // 合成分割结果：中央头顶完整，但画幅左侧有贴近上沿的前景残留。
+    const alpha=Buffer.alloc(image.width*image.height);
+    for(let y=30;y<200;y++)for(let x=180;x<270;x++)alpha[y*image.width+x]=255;
+    for(let y=4;y<7;y++)for(let x=129;x<132;x++)alpha[y*image.width+x]=255;
+    const stub=mock.method(vision,'segmentPortrait',async()=>alpha);
+    try { await checkedFailure(file,/^头顶离照片上沿太近$/); }
+    finally { stub.mock.restore(); }
+  });
+  await test('截断额头的 alpha 延后 1～2px 仍拒绝，不被软边缘绕过', async () => {
+    const file=path.join(tmp,'合成截断额头.png');
+    await sharp({create:{width:400,height:600,channels:4,background:'#ddd'}}).png().toFile(file);
+    const faceStub=mock.method(vision,'detectFaces',async()=>[{x:150,y:10,width:100,height:100}]);
+    try {
+      for(const firstRow of [0,1,2]) {
+        const alpha=Buffer.alloc(400*600);
+        for(let y=firstRow;y<400;y++)alpha.fill(255,y*400+150,y*400+250);
+        const alphaStub=mock.method(vision,'segmentPortrait',async()=>alpha);
+        try { await checkedFailure(file,/^照片头顶不完整，请使用头顶上方有留白的照片$/); }
+        finally { alphaStub.mock.restore(); }
+      }
+    } finally { faceStub.mock.restore(); }
+  });
+  await test('输出终检 5% 安全线及 8%～14% 头顶区间包含边界', async () => {
+    const f={x:40,width:20}, make=(head,artifact)=>{
+      const alpha=Buffer.alloc(100*100);alpha[head*100+50]=255;
+      if(artifact!=null)alpha[artifact*100]=255;
+      return {alpha,face:f};
+    };
+    assert.equal(validateOutputHeadroom(make(11,5),100,100),0.11);
+    assert.throws(()=>validateOutputHeadroom(make(11,4),100,100),/^Error: 头顶离照片上沿太近$/);
+    for(const y of [8,14])assert.equal(validateOutputHeadroom(make(y),100,100),y/100);
+    for(const y of [7,15])assert.throws(()=>validateOutputHeadroom(make(y),100,100),/头顶留白不符合/);
   });
   await test('竖图完整处理 + 原图不覆盖 + 输出碰撞另存', async () => {
     const f=path.join(tmp,'竖图.png'); await sharp(fixture).extend({top:100,bottom:100,background:'#eee'}).png().toFile(f);
