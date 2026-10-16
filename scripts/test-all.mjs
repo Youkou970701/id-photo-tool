@@ -4,9 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { mock } from 'node:test';
 const require = createRequire(import.meta.url);
 const sharp = require('sharp');
-const { validateOptions, decodeImage, cropForFace, encodeWithinRange, processPhoto, saveExclusive } = require('../src/photo');
+const { validateOptions, decodeImage, cropForFace, validateCrop, encodeWithinRange, processPhoto, saveExclusive } = require('../src/photo');
 const { detectFaces, segmentPortrait } = require('../src/vision');
 const root = fileURLToPath(new URL('../', import.meta.url));
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), '报名照-tests-'));
@@ -26,6 +27,15 @@ async function checkedOutput(file, options = opts) {
   assert.deepEqual(await fs.readFile(file), before, '原图不得改动');
   assert.equal(path.dirname(r.output), path.dirname(file));
   return r;
+}
+async function checkedFailure(file, message, options = opts) {
+  const before = await fs.readFile(file), files = (await fs.readdir(tmp)).sort();
+  const result = await processPhoto(file, options);
+  assert.equal(result.ok, false); assert.equal(result.output, undefined);
+  assert.match(result.note, message);
+  assert.deepEqual((await fs.readdir(tmp)).sort(), files, '失败不得产生文件');
+  assert.deepEqual(await fs.readFile(file), before, '失败不得改动原图');
+  return result;
 }
 try {
   await test('内置模型 SHA256 与许可证完整性', async () => {
@@ -72,6 +82,64 @@ try {
     assert.ok(Math.abs((face.x+face.width/2-crop.left)/crop.width-0.5)<1e-8);
     assert.ok((face.y-face.height*.35-crop.top)/crop.height>=.089);
     assert.ok(Math.abs(crop.width/crop.height-opts.width/opts.height)<1e-8);
+  });
+  await test('正常人像完整头顶仍然通过，且无放大提醒', async () => {
+    const file=path.join(tmp,'正常头顶.png');await fs.copyFile(fixture,file);
+    const r=await checkedOutput(file);assert.doesNotMatch(r.note,/原图偏小/);
+  });
+  await test('脸部特写少量上溢仍然通过（不得误拒绝）', async () => {
+    const file=path.join(tmp,'脸部特写.png');
+    await sharp(fixture).extract({left:135,top:27,width:180,height:260}).png().toFile(file);
+    const im=await decodeImage(file), faces=await detectFaces(im), crop=cropForFace(faces[0],opts.width,opts.height);
+    const overflow=-crop.top/crop.height;
+    assert.ok(overflow>0.09 && overflow<0.12,`特写上溢比例 ${overflow}`);
+    await checkedOutput(file);
+  });
+  await test('额头被截断拒绝，失败不生成文件', async () => {
+    const file=path.join(tmp,'额头被切.png');
+    await sharp(fixture).extract({left:110,top:90,width:290,height:420}).png().toFile(file);
+    await checkedFailure(file,/^照片头顶不完整，请使用头顶上方有留白的照片$/);
+  });
+  await test('下溢超过 5% 拒绝，不能补出悬空肩膀', async () => {
+    const file=path.join(tmp,'缺肩部.png');
+    await sharp(fixture).extract({left:100,top:0,width:300,height:210}).png().toFile(file);
+    await checkedFailure(file,/^照片下方需包含肩部$/);
+  });
+  await test('侧边溢出超过 15% 拒绝', async () => {
+    const file=path.join(tmp,'靠边.png');
+    await sharp(fixture).extract({left:200,top:0,width:250,height:512}).png().toFile(file);
+    await checkedFailure(file,/^人脸太靠近照片边缘$/);
+  });
+  await test('裁剪上溢 12%、下溢 5%、左右各 15% 为包含边界', async () => {
+    const im={width:200,height:200}, base={left:50,top:50,width:100,height:100};
+    for(const [crop,error] of [
+      [{...base,top:-12},/头顶不完整/], [{...base,top:105},/包含肩部/],
+      [{...base,left:-15},/靠近照片边缘/], [{...base,left:115},/靠近照片边缘/],
+    ]) {
+      assert.doesNotThrow(()=>validateCrop(im,crop,100));
+      const beyond={...crop};
+      if(crop.top!==base.top)beyond.top+=crop.top<0?-0.01:0.01;
+      else beyond.left+=crop.left<0?-0.01:0.01;
+      assert.throws(()=>validateCrop(im,beyond,100),error);
+    }
+  });
+  await test('90px 原图分辨率不足必须失败', async () => {
+    const file=path.join(tmp,'低清90.png');await sharp(fixture).resize(90).png().toFile(file);
+    await checkedFailure(file,/^原图分辨率不足（人脸区域约 \d+ 像素高，要求 220 像素），请换更清晰的原图$/);
+  });
+  await test('240px 原图配 150px 目标进入 1.2～1.5 倍提醒分支', async () => {
+    const file=path.join(tmp,'偏小240.png');await sharp(fixture).resize(240).png().toFile(file);
+    const r=await checkedOutput(file,{...opts,width:121,height:150});
+    assert.match(r.note,/原图偏小，已放大 1\.[234]\d 倍，请放大检查清晰度/);
+  });
+  await test('240px 原图配默认 220px 目标超过 1.5 倍仍须拒绝', async () => {
+    const file=path.join(tmp,'默认目标240.png');await sharp(fixture).resize(240).png().toFile(file);
+    await checkedFailure(file,/原图分辨率不足/);
+  });
+  await test('放大倍数恰好 1.5 可用，超过即拒绝', async () => {
+    const im={width:200,height:200}, crop={left:50,top:50,width:100,height:100};
+    assert.equal(validateCrop(im,crop,150),1.5);
+    assert.throws(()=>validateCrop(im,crop,150.01),/原图分辨率不足/);
   });
   await test('真实 ONNX 抠图分离背景和人物', async () => {
     const mask=await segmentPortrait(image); assert.equal(mask.length,image.width*image.height);
@@ -127,6 +195,36 @@ try {
   });
   await test('损坏输入明确报错',async()=>{
     const f=path.join(tmp,'损坏.heic');await fs.writeFile(f,'not a photo');const r=await processPhoto(f,opts);assert.equal(r.ok,false);assert.match(r.note,/无法读取图片/);
+  });
+  await test('JPEG 元数据可读但像素解码失败，统一中文提示', async () => {
+    const file=path.join(tmp,'截断.jpg'), jpeg=await sharp(fixture).jpeg().toBuffer();
+    await fs.writeFile(file,jpeg.subarray(0,Math.floor(jpeg.length*0.6)));
+    assert.equal((await sharp(file).metadata()).format,'jpeg','确保覆盖元数据之后的像素解码错误');
+    await assert.rejects(decodeImage(file),{message:'无法读取图片，文件可能损坏或格式不受支持'});
+    await checkedFailure(file,/^无法读取图片，文件可能损坏或格式不受支持$/);
+  });
+  await test('输出 EACCES/EPERM/EROFS 使用中文提示且不暴露路径', async () => {
+    const file=path.join(tmp,'写权限.png');await fs.copyFile(fixture,file);
+    for(const code of ['EACCES','EPERM','EROFS']) {
+      const stub=mock.method(fs,'open',async()=>{throw Object.assign(new Error(`${code}: ${file}`),{code});});
+      try {
+        const r=await checkedFailure(file,/^无法写入原图所在文件夹，请把照片复制到桌面等可写位置再试$/);
+        assert.ok(!r.note.includes(tmp));assert.ok(!r.note.includes(code));
+      } finally { stub.mock.restore(); }
+    }
+  });
+  await test('输出创建后写入被拒绝，清理半成品并隐藏路径', async () => {
+    const originalOpen=fs.open;
+    const stub=mock.method(fs,'open',async (...args)=>{
+      const handle=await originalOpen(...args);
+      handle.writeFile=async()=>{throw Object.assign(new Error(`EACCES: ${args[0]}`),{code:'EACCES'});};
+      return handle;
+    });
+    try {
+      await assert.rejects(saveExclusive(path.join(tmp,'半成品.png'),Buffer.from('image')),
+        {message:'无法写入原图所在文件夹，请把照片复制到桌面等可写位置再试'});
+      await assert.rejects(fs.stat(path.join(tmp,'半成品-报名照.jpg')),{code:'ENOENT'});
+    } finally { stub.mock.restore(); }
   });
   await test('所有预设带 source，未核实字段为空', async () => {
     const presets=JSON.parse(await fs.readFile(path.join(root,'presets.json'),'utf8'));

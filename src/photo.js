@@ -5,6 +5,13 @@ const sharp = require('sharp');
 const { detectFaces, segmentPortrait } = require('./vision');
 const KB = 1024;
 const MAX_PIXELS = 100_000_000;
+const MAX_TOP_OVERFLOW_RATIO = 0.12;
+const MAX_BOTTOM_OVERFLOW_RATIO = 0.05;
+const MAX_SIDE_OVERFLOW_RATIO = 0.15;
+const MAX_UPSCALE_FACTOR = 1.5;
+const WARN_UPSCALE_FACTOR = 1.2;
+const DECODE_ERROR = '无法读取图片，文件可能损坏或格式不受支持';
+const WRITE_PERMISSION_ERROR = '无法写入原图所在文件夹，请把照片复制到桌面等可写位置再试';
 
 function validateOptions(o = {}) {
   const { width, height, minKB, maxKB, background } = o;
@@ -24,7 +31,7 @@ async function decodeImage(input) {
   const buffer = await fs.readFile(input);
   let meta;
   try { meta = await sharp(buffer, { limitInputPixels: MAX_PIXELS }).metadata(); }
-  catch { throw new Error('无法读取图片，文件可能损坏或格式不受支持'); }
+  catch { throw new Error(DECODE_ERROR); }
   if (!meta.width || !meta.height || meta.width * meta.height > MAX_PIXELS) throw new Error('原图超过 1 亿像素限制');
   if ((meta.pages || 1) > 1 && meta.format !== 'heif') throw new Error('请选择单张静态照片');
   let image;
@@ -36,10 +43,12 @@ async function decodeImage(input) {
       image = sharp(Buffer.from(decoded.data), { raw: { width: decoded.width, height: decoded.height, channels: 4 } });
     } catch { throw new Error('HEIC 解码失败，请确认文件完整且未损坏'); }
   } else image = sharp(buffer, { limitInputPixels: MAX_PIXELS }).rotate();
-  const { data, info } = await image.toColourspace('srgb').ensureAlpha()
-    .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
-    .raw().toBuffer({ resolveWithObject: true });
-  return { data, width: info.width, height: info.height, channels: 4 };
+  try {
+    const { data, info } = await image.toColourspace('srgb').ensureAlpha()
+      .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
+      .raw().toBuffer({ resolveWithObject: true });
+    return { data, width: info.width, height: info.height, channels: 4 };
+  } catch { throw new Error(DECODE_ERROR); }
 }
 
 function cropForFace(face, width, height) {
@@ -50,9 +59,24 @@ function cropForFace(face, width, height) {
     top: face.y - face.height * 0.35 - cropHeight * 0.09, width: cropWidth, height: cropHeight };
 }
 
+function validateCrop(image, crop, targetHeight) {
+  if (Math.max(0, -crop.top) / crop.height > MAX_TOP_OVERFLOW_RATIO)
+    throw new Error('照片头顶不完整，请使用头顶上方有留白的照片');
+  if (Math.max(0, crop.top + crop.height - image.height) / crop.height > MAX_BOTTOM_OVERFLOW_RATIO)
+    throw new Error('照片下方需包含肩部');
+  // 左、右分别按裁剪框宽度判断，少量越界仍可用于补足留白。
+  if (Math.max(0, -crop.left, crop.left + crop.width - image.width) / crop.width > MAX_SIDE_OVERFLOW_RATIO)
+    throw new Error('人脸太靠近照片边缘');
+  const upscale = targetHeight / crop.height;
+  if (upscale > MAX_UPSCALE_FACTOR)
+    throw new Error(`原图分辨率不足（人脸区域约 ${Math.round(crop.height)} 像素高，要求 ${targetHeight} 像素），请换更清晰的原图`);
+  return upscale;
+}
+
 async function renderPortrait(image, face, options) {
   const { width, height, background } = options;
   const crop = cropForFace(face, width, height);
+  validateCrop(image, crop, height);
   // 在有界工作分辨率抠图后取景，保留透明 PNG 自带的 alpha。
   const mask = await segmentPortrait(image);
   const rgba = Buffer.from(image.data);
@@ -119,7 +143,10 @@ async function saveExclusive(input, data) {
       try { await handle.writeFile(data); await handle.close(); }
       catch (e) { await handle.close().catch(() => {}); await fs.unlink(output).catch(() => {}); throw e; }
       return output;
-    } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    } catch (e) {
+      if (['EACCES', 'EPERM', 'EROFS'].includes(e.code)) throw new Error(WRITE_PERMISSION_ERROR);
+      if (e.code !== 'EEXIST') throw e;
+    }
   }
   throw new Error('同名输出文件过多，请整理目录后重试');
 }
@@ -133,6 +160,7 @@ async function processPhoto(input, options, onProgress = () => {}) {
     const faces = await detectFaces(image);
     if (!faces.length) throw new Error('未检测到人脸，请使用清晰、正面、光线充足的单人人像');
     if (faces.length !== 1) throw new Error(`检测到 ${faces.length} 张人脸，请使用只有一人的照片`);
+    const upscale = validateCrop(image, cropForFace(faces[0], o.width, o.height), o.height);
     onProgress('本地抠图、裁剪和换底色…');
     const pixels = await renderPortrait(image, faces[0], o);
     onProgress('匹配文件大小区间…');
@@ -143,7 +171,10 @@ async function processPhoto(input, options, onProgress = () => {}) {
     const output = await saveExclusive(input, data);
     return { ok: true, output, bytes: data.length, width: meta.width, height: meta.height,
       quality, scale, preview: 'data:image/jpeg;base64,' + data.toString('base64'),
-      note: scale < 1 ? '已降低细节分辨率以满足大小，请放大检查清晰度。报名是否通过仍以官方审核为准。' : '请检查发丝边缘、头顶留白与清晰度，报名是否通过以官方审核为准。' };
+      note: [
+        upscale >= WARN_UPSCALE_FACTOR ? `原图偏小，已放大 ${upscale.toFixed(2)} 倍，请放大检查清晰度。` : '',
+        scale < 1 ? '已降低细节分辨率以满足大小，请放大检查清晰度。报名是否通过仍以官方审核为准。' : '请检查发丝边缘、头顶留白与清晰度，报名是否通过以官方审核为准。',
+      ].filter(Boolean).join('') };
   } catch (e) { return { ok: false, note: e.message }; }
 }
 
@@ -153,4 +184,6 @@ async function previewPhoto(input) {
     .resize({ width: 720, height: 720, fit: 'inside', withoutEnlargement: true }).png().toBuffer();
   return 'data:image/png;base64,' + data.toString('base64');
 }
-module.exports = { KB, validateOptions, decodeImage, cropForFace, renderPortrait, encodeWithinRange, saveExclusive, processPhoto, previewPhoto };
+module.exports = { KB, MAX_TOP_OVERFLOW_RATIO, MAX_BOTTOM_OVERFLOW_RATIO, MAX_SIDE_OVERFLOW_RATIO,
+  MAX_UPSCALE_FACTOR, WARN_UPSCALE_FACTOR, validateOptions, decodeImage, cropForFace, validateCrop,
+  renderPortrait, encodeWithinRange, saveExclusive, processPhoto, previewPhoto };
