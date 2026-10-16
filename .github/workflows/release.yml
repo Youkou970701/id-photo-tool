@@ -1,0 +1,64 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  # 先建好 release，两个平台再往里传文件，避免同时创建出两个草稿。
+  # 手动运行也必须选已有版本 tag，禁止从分支发布安装包。
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 校验版本 tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "发布必须使用 v 开头的版本 tag（例如 v1.0.0）。"
+            exit 1
+          fi
+      - name: 创建 release（已存在则跳过）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "报名照助手 $GITHUB_REF_NAME" --notes "下载对应系统的安装包：Apple 芯片 Mac 选 .dmg，Windows x64 选 .exe 或 .zip。照片仅在本机处理。"
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: mac
+            targets: dmg
+            arch: arm64
+          - os: windows-latest
+            platform: win
+            targets: nsis zip
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 校验 tag 与包版本一致
+        run: node -e "if ('v'+require('./package.json').version !== process.env.GITHUB_REF_NAME) process.exit(1)"
+      - run: npm ci
+        env:
+          ONNXRUNTIME_NODE_INSTALL: skip
+      - name: 验证内置模型完整性
+        run: node scripts/verify-models.mjs
+      - name: 运行全部测试
+        run: node scripts/test-all.mjs
+      - name: Build & publish
+        run: npx electron-builder --${{ matrix.platform }} ${{ matrix.targets }} --${{ matrix.arch }} --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false

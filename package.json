@@ -1,0 +1,101 @@
+{
+  "name": "id-photo-tool",
+  "version": "0.1.0",
+  "description": "报名照助手：离线裁剪、换底色、精确控制照片大小",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node scripts/test-all.mjs",
+    "dist": "node scripts/verify-models.mjs && electron-builder",
+    "dist:local": "node scripts/verify-models.mjs && electron-builder -c.electronDist=node_modules/electron/dist --mac --arm64",
+    "test:ui": "electron scripts/screenshot.js",
+    "test:packaged": "electron scripts/test-packaged.cjs"
+  },
+  "dependencies": {
+    "heic-decode": "2.1.0",
+    "onnxruntime-node": "1.24.3",
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "electron-builder": "26.15.3",
+    "electron": "44.7.0"
+  },
+  "author": "xiaoyang",
+  "license": "MIT",
+  "build": {
+    "appId": "com.xiaoyang.idphototool",
+    "productName": "报名照助手",
+    "artifactName": "IdPhotoTool-${version}-${os}-${arch}.${ext}",
+    "electronVersion": "44.7.0",
+    "files": [
+      "src/**/*",
+      "presets.json",
+      "package.json",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md"
+    ],
+    "asarUnpack": [
+      "node_modules/onnxruntime-node/**/*",
+      "node_modules/sharp/**/*",
+      "node_modules/@img/**/*",
+      "node_modules/libheif-js/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/models",
+        "to": "models"
+      },
+      {
+        "from": "vendor/licenses",
+        "to": "licenses"
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "identity": null,
+      "category": "public.app-category.utilities"
+    },
+    "dmg": {
+      "sign": false
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Youkou970701",
+      "repo": "id-photo-tool",
+      "releaseType": "release"
+    }
+  }
+}

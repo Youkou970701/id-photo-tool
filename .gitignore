@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+# 模型本体随仓库提交，安装及运行均无需再下载。
