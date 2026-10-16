@@ -3,9 +3,6 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const sharp = require('sharp');
 const ort = require('onnxruntime-node');
-const { ROLL_DEAD_ZONE_DEG, rollDegrees } = require('./pose');
-const LANDMARK_CONTEXT_FACTOR = 2.5;
-const LANDMARK_MATCH_IOU = 0.5;
 const sessions = new Map();
 const { workerData } = require('node:worker_threads');
 function modelDir() {
@@ -31,7 +28,7 @@ function iou(a, b) {
   const intersection = w * h;
   return intersection / (a.width * a.height + b.width * b.height - intersection);
 }
-async function detectFacesRaw(image) {
+async function detectFaces(image) {
   const size = 640, ratio = Math.min(size / image.width, size / image.height);
   const w = Math.max(1, Math.round(image.width * ratio)), h = Math.max(1, Math.round(image.height * ratio));
   const rgb = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
@@ -68,26 +65,6 @@ async function detectFacesRaw(image) {
   const selected = [];
   for (const face of faces) if (selected.every(other => iou(face, other) < 0.3)) selected.push(face);
   return selected;
-}
-async function detectFaces(image) {
-  const faces = await detectFacesRaw(image);
-  for (const face of faces) {
-    if (Math.abs(rollDegrees(face)) <= ROLL_DEAD_ZONE_DEG) continue;
-    // 小人脸的眼线对几像素的定位误差很敏感。有倾斜候选时，以带上下文的
-    // 局部画面复测关键点；仅替换关键点，保留全图 bbox、分数及 NMS 结果。
-    const size = Math.round(Math.max(face.width, face.height) * LANDMARK_CONTEXT_FACTOR);
-    const left = Math.max(0, Math.round(face.x + face.width / 2 - size / 2));
-    const top = Math.max(0, Math.round(face.y + face.height / 2 - size / 2));
-    const width = Math.min(size, image.width - left), height = Math.min(size, image.height - top);
-    if (width <= 0 || height <= 0) continue;
-    const data = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
-      .extract({ left, top, width, height }).raw().toBuffer();
-    const candidates = (await detectFacesRaw({ data, width, height })).map(f => ({ ...f, x: f.x + left, y: f.y + top }));
-    candidates.sort((a, b) => iou(b, face) - iou(a, face));
-    if (candidates[0] && iou(candidates[0], face) >= LANDMARK_MATCH_IOU)
-      face.landmarks = candidates[0].landmarks.map(([x, y]) => [x + left, y + top]);
-  }
-  return faces;
 }
 async function segmentPortrait(image) {
   const net = await session('modnet.onnx');
