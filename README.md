@@ -23,7 +23,7 @@
 
 ## 下载
 
-首版正在验收，尚未发布安装包。验收后到 [Releases 页面](https://github.com/Youkou970701/id-photo-tool/releases) 下载：
+到 [Releases 页面](https://github.com/Youkou970701/id-photo-tool/releases/latest) 下载：
 
 | 系统 | 文件 |
 | --- | --- |
@@ -116,7 +116,7 @@ Electron · [sharp](https://sharp.pixelplumbing.com/) · [onnxruntime-node](http
 
 沿用 compress-tool 的 `src/`、`scripts/`、`build/`、`docs/`、`vendor/`、`.github/workflows/` 结构。新增的 `tests/fixtures/` 保存离线测试图，`presets.json` 保存有出处的报名要求。
 
-GitHub Actions 推 `v*` tag 后自动创建 Release，在 `macos-14` 打 mac-arm64 DMG，在 `windows-latest` 打 win-x64 EXE / ZIP，分别上传同一个 Release。打包前必须通过模型哈希校验和全部测试。当前验收阶段不推 tag、不触发 Release。
+GitHub Actions 推 `v*` tag 后自动创建 Release，在 `macos-14` 打 mac-arm64 DMG，在 `windows-latest` 打 win-x64 EXE / ZIP，分别上传同一个 Release。打包前必须通过模型哈希校验和全部测试。发版方式：改 `package.json` 版本号，提交后推 `vX.Y.Z` tag。
 
 ## 模型来源与许可
 
